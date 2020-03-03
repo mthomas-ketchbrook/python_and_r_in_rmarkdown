@@ -1,0 +1,293 @@
+---
+title: "Solving the Data Science Dilemma"
+subtitle: "From \"R *or* Python\" to \"R *and* Python\""
+author: "Ketchbrook Analytics"
+date: "2/18/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r rImports, warning=FALSE, message=FALSE}
+
+# Run once:
+# install.packages(c("reticulate",
+#                    "dplyr",
+#                    "ggplot2", 
+#                    "RSocrata", 
+#                    "reshape2", 
+#                    "lubridate"))
+
+library(dplyr)
+library(ggplot2)
+library(RSocrata)
+library(reshape2)
+library(lubridate)
+library(xts)
+library(here)
+
+# Run once:
+# reticulate::py_install("pandas")
+# reticulate::py_install("statsmodels")
+
+# Import custom functions from 'functions.R' file
+source(
+  here::here(
+    "functions.R"
+  )
+)
+
+
+library(reticulate)
+reticulate::use_virtualenv(virtualenv = "r-reticulate")
+reticulate::py_available(TRUE)
+
+```
+
+
+```{python pyImports}
+# Python
+
+import pandas as pd
+from statsmodels.tsa.vector_ar.var_model import VAR
+
+```
+
+
+## Project - Predicting the CT Prison Population
+
+In this analysis, we'll attempt to build two models (one in R, and one in Python) to predict the total monthly prison population for every month in the year 2020, based off of training the models on historical data.  
+
+The prison population data can be found in the  [CT Open Data Repository](https://data.ct.gov/Public-Safety/Correctional-Facility-Daily-Population-Count-By-Fa/n8x6-s299).  
+
+We'll also use some data on monthly CT non-farm employment statistics to use as a regressor variable to hopefully help us predict the prison population.  This data is also accessible via the [CT Open Data Repository](https://data.ct.gov/Government/Department-of-Labor-Office-of-Research-Current-Emp/8zbs-9atu)
+
+### Import data using R
+
+```{r getData}
+
+my_data <- GetData()
+
+```
+
+Now we have an R dataframe named **my_data** in memory.  Let's take a look at the first few rows of data, some summary statistics, and the observations with the lowest total state prison population.
+
+But... let's use Python to do so: 
+
+### Profiling Data using Python and calling R dataframe with "r."
+
+```{python seeData}
+# Python
+
+# We can execute Python against R dataframe objects by prepending the R dataframe name with 'r.'
+
+r.my_data.head()
+
+```
+
+```{python describeData}
+# Python
+
+# We can execute Python against R dataframe objects by prepending the R dataframe name with 'r.'
+
+r.my_data.describe()
+
+```
+
+```{python sortData}
+# Python
+
+# We can execute Python against R dataframe objects by prepending the R dataframe name with 'r.'
+
+r.my_data.sort_values(by = 'total.state.prison.pop').head()
+
+```
+
+
+## Preparing Data for Forecasting
+
+First, we have to split the 
+
+```{r trainTestSplit}
+
+# Split the data into "train" and "test" sets
+# We'll train the model on the "train" data, and evaluate how accurate the model makes predictions using the "test data
+train_df <- my_data %>% 
+  dplyr::filter(date < as.Date("2019-01-01"))
+
+test_df <- my_data %>% 
+  dplyr::filter(date >= as.Date("2019-01-01"))
+
+# Visualize the train/test data split
+ggplot2::ggplot(
+  my_data %>% 
+    dplyr::mutate(train.test = ifelse(date < as.Date("2019-01-01"), 
+                                      "train", 
+                                      "test")), 
+  ggplot2::aes(x = date, 
+               y = total.state.prison.pop, 
+               col = train.test)) + 
+  ggplot2::geom_line()
+
+```
+
+In time series forecasting, we have to remove trend from the data in order to ensure that *"time"* itself isn't a factor in your final model equation.  One of the simplest ways to do this is to transform the dataset into the between-period differences.  Removing trend is referred to as making the data *"stationary"*.
+
+```{r makeStationary}
+
+train_df_stry <- train_df %>% 
+  dplyr::mutate(total.state.prison.pop.diffs = c(NA, diff(total.state.prison.pop)), 
+                total.nonfarm.employed.diffs = c(NA, diff(total.nonfarm.employed))) %>% 
+  dplyr::select(date,
+                total.state.prison.pop.diffs, 
+                total.nonfarm.employed.diffs)
+
+train_df_stry <- xts::xts(train_df_stry[,2:3], 
+                          order.by = train_df_stry$date)
+
+# create stationary test dataframe
+test_df_stry <- train_df %>% 
+  dplyr::bind_rows(test_df) %>% 
+  dplyr::mutate(total.state.prison.pop.diffs = c(NA, diff(total.state.prison.pop)), 
+                total.nonfarm.employed.diffs = c(NA, diff(total.nonfarm.employed))) %>% 
+  dplyr::select(date,
+                total.state.prison.pop.diffs, 
+                total.nonfarm.employed.diffs) %>% 
+  dplyr::filter(date >= as.Date("2019-01-01"))
+
+test_df_stry <- xts::xts(test_df_stry[,2:3], 
+                         order.by = test_df_stry$date)
+
+```
+
+We can take a look at what the new **train** and **test** datasets look like.  Don't worry, we'll reverse engineer this at the end to give the end user the true predicted prison population values.
+
+```{r plotStationary}
+
+ggplot2::ggplot(
+  data.frame(
+    date = zoo::index(train_df_stry), 
+    zoo::coredata(train_df_stry)
+  ) %>% 
+    dplyr::bind_rows(
+      data.frame(
+        date = zoo::index(test_df_stry), 
+        zoo::coredata(test_df_stry)
+      )
+    ) %>% 
+    dplyr::mutate(train.test = ifelse(date < as.Date("2019-01-01"), 
+                                      "train", 
+                                      "test")), 
+  ggplot2::aes(
+    x = date, 
+    y = total.state.prison.pop.diffs, 
+    col = train.test
+  )) + 
+  ggplot2::geom_line()
+
+```
+
+```{r train_df_stry_rdf}
+
+train_df_stry_rdf <- data.frame(
+  date = zoo::index(train_df_stry), 
+  zoo::coredata(train_df_stry)
+) %>% 
+  tidyr::drop_na()
+
+test_df_stry_rdf <- data.frame(
+  date = zoo::index(test_df_stry), 
+  zoo::coredata(test_df_stry)
+)
+
+str(train_df_stry_rdf)
+
+```
+
+
+
+```{python makePandasDF}
+# Python
+
+#Training model on training set
+
+py_train_data_stry = r.train_df_stry_rdf
+
+py_train_data_stry = py_train_data_stry.set_index('date')
+
+py_test_data_stry = r.test_df_stry_rdf
+
+py_test_data_stry = py_test_data_stry.set_index('date')
+
+
+py_train_data_stry.head()
+
+```
+
+```{python PyTrainVAR}
+# Python
+
+#Training model on training set
+model = VAR(endog=py_train_data_stry.values)
+model_fit = model.fit(2)
+
+# make prediction on "test" set
+prediction = model_fit.forecast(model_fit.endog, steps=len(py_test_data_stry))
+
+prediction
+
+```
+
+### Call the Python predictions array in R using "py$"
+
+```{r getPreds}
+
+diffd_preds <- py$prediction
+
+diffd_preds
+
+```
+
+### Convert this differenced values back to prison population predicted values
+
+```{r convertBackDiffs}
+
+# Calculate the actual predicted values after reconstructing the "differenced" predictions
+pop_preds <- c(train_df$total.state.prison.pop[train_df$date == max(train_df$date)], 
+               rep(NA, 12))
+
+for (i in 1:12) {
+  
+  pop_preds[i+1] <- pop_preds[i] + diffd_preds[i]
+  
+}
+
+pop_preds <- pop_preds[-1]
+
+pop_preds
+
+```
+
+### Visualize Actuals vs. the Predictions
+
+```{r createFullDataframe, fig.width=15, fig.height=12}
+
+test_df %>% 
+  dplyr::select(-total.nonfarm.employed) %>% 
+  dplyr::mutate(pred = pop_preds) %>% 
+  tidyr::pivot_longer(-date, names_to = "Group", values_to = "total.state.prison.pop") %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(x = date, 
+                 y = total.state.prison.pop, 
+                 col = Group)
+  ) + 
+  ggplot2::geom_line(size = 2)
+
+```
+
+
+
+
